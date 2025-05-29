@@ -1,0 +1,1727 @@
+---
+author: "Julie Jung"
+date: "Feb 15, 2023"
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+# 16S-rRNA-analysis
+
+How to process 16S rRNA sequencing data with the DADA2 pipeline
+
+Here I write my notes on how I conducted metagenomic and 16S analysis of GSL samples from 2020.
+
+Modified versions of the pipeline and scripts are detailed [here](https://github.com/tkarasov/pathodopsis) and [here](https://github.com/LangilleLab/microbiome_helper/wiki/DADA2-16S-Chemerin-Tutorial).
+
+```{r session-info}
+# Display current R session information
+sessionInfo()
+```
+
+## About the dataset
+
+This dataset consists a total of 15 samples generated from individual nematodes. The bacteria could be what the nematode ate or it could be bacteria found on the surface - we can't be sure. We could have washed the worms to see only what they ate, but we didn't want to exclude the cuticular bacteria, since these could also serve some symbiotic function. 
+
+What is amplicon sequencing? 
+
+[Amplicon sequencing](https://astrobiomike.github.io/misc/amplicon_and_metagen) is a common method of identifying which taxa are present in a sample based on amplified marker genes. This approach contrasts with shotgun metagenomics where all the DNA in a sample is sequenced. The most common marker gene used for prokaryotes is the 16S ribosomal RNA gene. It features regions that are conserved among these organisms, as well as variable regions that allow distinction among organisms. These characteristics make this gene useful for analyzing microbial communities at reduced cost compared to shotgun metagenomics approaches. Only a subset of variable regions are generally sequenced for amplicon studies and you will see them referred to using syntax like "V3-V4" (i.e. variable regions 3 to 4) in scientific papers.
+
+For our purposes, the region used for amplification and sequencing is the V4 region of the 16S rRNA gene. The primers used were 515F and 806R, creating an amplicon of around 250bp. Sequencing was performed in 2x300 bp paired-end mode on an Illumina MiSeq machine. This means the amplicon is basically covered twice by each read-pair, which is important to assure high quality 16S amplicon sequences.
+
+## Prepare your raw data
+
+### metadata
+
+The metadata associated with each sample is indicated in the mapping file (map.txt). In this mapping file, the genotypes of interest can be seen. Although optional, it's generally a good idea to include as much metadata as possible, since this data can easily explored later on.
+
+Typical mapping files include SampleID, BarcodeSequence, LinkerPrimerSequence, BarcodeName, Repeats, ProjectName, Description. All we really care about for demultiplexing are this first and second columns, the sample name and barcode.
+
+The [barcodes](https://ipyrad.readthedocs.io/en/latest/5-demultiplexing.html) file is a simple table linking barcodes to samples. Barcodes can be of varying lengths. Each line should have one name and then one barcode, separated by whitespace (a tab or spaces). 
+
+### raw data
+
+We'll start with raw data in the form of a bunch of files for each sample you sequenced. These files carry the raw sequence data in FastQ format.
+
+The file names will look like this: samplename\_S70\_L001\_R1\_001.fastq.gz
+
+The first part is the sample name. S70 tells you it is sample 70 of this specific sequencing run (can also be index sequences used in multiplexing). L001 is always lane 1 for the MiSeq. R1 means it's the forward read of the sequencing data (there should be another file that says R2, while is the read pair). 001 is always 001 for some reason. fastq.gz means that the file is in FastQ format and the file is compressed using the Gzip compression.
+
+To look at what is in the file, first we need to navigate to the directory that's holding your raw_reads, and decommpress each file (gunzip). For example, here let's pass the output the stdout (-c), pipe it to the next command, and display the first four lines in the file: 
+
+```{bash, eval=FALSE, engine="sh"}
+gunzip -c 1_S1_L001_R1_001.fastq.gz | head -n 4
+```
+
+We get something that looks like this: 
+
+```{bash, eval=FALSE, engine="sh"}
+@M06923:26:000000000-JV49B:1:1101:9099:1079 1:N:0:CGTCGGTAA
+CTGAGTGTCAGCCGCCGCGGTAATACGGAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGCGCGTAGGTGGCTTGATAAGCCGGTTGTGAAAGCCCCGGGCTCAACCTGGGAACGGCATCCGGAACTGTCAGGCTAGAGTGCAGGAGAGGAAGGTAGAATTCCCGGTGTAGCGGTGAAATGCGTAGAGATCGGGAGGAATACCAGTGGCGAAGGCGGCCTTCTGGACTGACACTGACACTGAGGTGCGAAAGCGTGGGTAGCAAACAGGATTAGATACCCTGGTAGTCCACGCC
++
+CCCCCGGGGGGGGGGGGGGGGGGGGFGGCFGGGGGGGGGGGGGFGGGGGGGGGGGGGGGGGGD7ECEGGGGGGGGGGGGGGGGGFGGGGGGGGGGGGGGGGGFDEEGGEGGGGGGGGGGGGGGGGGGGGGGGGGGFFFF7FGGGGGGGGGGGGGGGGGCGGFFGGGGGGGGGGGGGGGGEGGGGFGFFFGCEGGGFFFEGGGEC8E?FGGGGGGGGGECGGGGGGG*CFGGGGGGGGD679?:*69<FFFF<>F>:>6>?DFGGFF)1:AFFF>?BF0<<?):9<F66><?)44:)6<?><
+```
+This output is the standard format of the FastQ sequencing data format. One sequence in FastQ format always consists of four lines:
+
+- Line 1: This line is the start of the entry and always starts with the @ symbol, followed by a unique sequence ID. This ID is the same in both read files (R1+R2) and defines which sequences belong together. When looking at Illumina sequencing data, this ID consists of the unique instrument ID (M06923), the run ID (26), the flowcell ID (JV49B) and the lane (1), followed by coordinates of the sequence cluster on the flowcell. After the space there are more informations on the sequence, however these do not belong to the unique sequence ID. The last sequence is the barcode/index (CGTCGGTAA). 
+
+- Line 2: This is the actual sequence obtained from basecalling of the raw data. In our case this is the 16S amplicon sequence.
+
+- Line 3: This line can contain additional information about the sequence, however usually only contains a mandatory ‚+’ symbol.
+
+- Line 4: In this line the quality of every single base in the sequence is encoded. The first position of this line corresponds to the first position of the sequence, the second to the second, and so on. Each ASCII-character encodes a special value between 0 and 41 (in the most widely used Illumina 1.8 "Phred+33" format; +33 stands for an offset of 33 in the ASCII characters). The highest Phred score a base can get is in this case 41, encoded by the letter J (ASCII: 74), the lowest is 0, encoded by ! (ASCII: 33). The Phred score (Q) is defined as the probability (P), that the base at this position is incorrect: P(Q)=10-Q10. This corresponds to 0.01% error probability at Q=40 and 10% at Q=10.
+
+
+Phred+33 encoding of quality scores:
+```{bash, eval=FALSE, engine="sh"}
+Symbol	 !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJ
+        |                                        |          
+ASCII	  33                                      73
+Q Score	0.2......................26...31........41                      
+```
+
+Of course it is not possible to check each single sequence by ‘hand’, however there are a lot of very handy tools to check if the sequencing in general yielded satisfactory data. One tool we want to introduce is the very easy to use and freely available FastQC. Please go the [website](http://www.bioinformatics.babraham.ac.uk/projects/fastqc/) using the browser in the VirtualBox, download the Linux version of the tool and unpack it. For this, please create a folder in the "16S-rRNA-analysis" folder called "software", double-click on the downloaded archive and move the ‘FastQC’ folder into the newly created ‘software’ folder. Go to the terminal again and change to the FastQC software folder:
+
+```{bash, eval=FALSE, engine="sh"}
+cd /Users/juliejung/Desktop/Github/16S-rRNA-analysis/software/FastQC  
+```
+
+To use fastqc, we first have to make the binary file executable. For this type this into the terminal:
+
+```{bash, eval=FALSE, engine="sh"}
+chmod +x fastqc
+```
+
+The command chmod can be used to change the mode or access permission of a file. Here we add permission to execute (+x) to the fastqc binary. Now we can start FastQC:
+
+```{bash, eval=FALSE, engine="sh"}
+./fastqc
+```
+
+This should open the FastQC software. In the Menu bar go to: “File > Open …” and navigate to the raw_data folder in Shared_Folder. By holding the Shift key you can select multiple files at once. Please select the R1 and R2 read of the Sample “B-1105-W” and click the “OK” button. You will see the files being processed and quickly the reports should open, each as a tab in the FastQC window. On the left side you will see several green, orange and red symbols. These are the different quality criteria assessed by FastQC. However, let’s start with the first one called “Basic statistic”. Here you can already see some basic properties of the opened files, for example that each of the files holds 555172 sequences (as they are the paired reads of the same sample this should be the same; if it is not, there is something wrong), the sequence lengths are between 35 and 301 nt and the GC content differs slightly between R1 and R2, however both being around 50%.
+
+Next please have a look at the “Per base sequence quality” tab for both files. What you see here is a pretty typical (though not perfect) example of how amplicon sequencing data normally looks like:
+
+the R1 is relatively good quality all along, only dropping a little at the end of the read, however mostly staying in the green area until ~280 nt. the R2 is usually of worse quality than the R1. This is is basically what you can expect and mainly due to technical reasons. Only if you see really strange patterns of very drastic drops in quality (also maybe only at a single position across all samples) things might have to be investigated more deeply.
+
+Move on to the tab called “Per base sequence content”. This tab will likely be marked with a red cross, indicating a problem. When you look at the image in this tab, you can see the per-position composition of the four nucleotides and notice, that there is only very little variation in the first 8-9 nt. This is just as it is supposed to be, as the amplification primers have to bind in a non- or at least less-variable region of the 16S gene to work. As FastQC is intended to be used for any kind of sequencing data, it assumes that this is an error, however in our case, again, this is what we are expecting.
+
+The same rules apply for GC content (of course there is a bias in GC content when only looking at a specific sequence) and duplicated/overrepresented sequences: we expect to have many duplicated or similar sequences, as this is exactly the purpose of using an amplicon.
+
+In general we can say: our data look just like we expect it to look!
+
+One more very convenient thing about FastQC is, that you can also use it for batch processing of FastQ file. Close the FastQC window and type:
+
+```{bash, eval=FALSE, engine="sh"}
+wosho=/Users/juliejung/Desktop/Github/16S-rRNA-analysis
+echo $wosho 
+raw=$wosho/data/raw_reads
+echo $raw
+./fastqc $raw/*_001* --outdir /Users/juliejung/Desktop/Github/16S-rRNA-analysis
+```
+
+In the first line, we set a variable named “wosho”. This is very easy in the bash environment and might look a little different in other programming languages. In general, many things can be stored in variables, however, here we use it for a path to a folder. In the third line, we set another variable “raw”, which has the same content as “wosho”, plus “/raw_reads” at the end. As you can see, the content of the variables can be show by using “echo” followed by the variable with a dollar sign prepended. The last line starts the fastqc binary, applied to all files in the folder that is stored in the “raw” variable that have "_001" in the middle of the name. The asterisk “*” is a so-called “wildcard” and matches every character when searching for filenames.
+
+Now look at your output directory. For each input sample, there should be two html files you can open with your browser. These file hold all the information we saw before in the FastQC window and this way of processing can be easily applied to a whole batch of sequencing files for fast processing to get an idea if your data looks usable.
+
+Another software that is very nice for getting an overview of sequencing data in general is [MultiQC](http://multiqc.info), which is able to aggregate the output of different QC tools to create reports. However, this is currently more aiming at RNAseq or RRBS experiments, but worth keeping an eye on.
+
+## Demultiplex
+
+For this part of the analysis, I used [this](https://astrobiomike.github.io/amplicon/demultiplexing) and [this](https://github.com/tkarasov/pathodopsis) and [this](http://protocols.faircloth-lab.org/en/latest/protocols-computer/sequencing/sequencing-demultiplex-a-run.html). 
+
+Several samples can be combined into a single sequencing run by using "multiplexing" where a barcode/index sequence identifying the sample is inserted into the sequencing construct. Once sequenced, the data generally need to be demultiplexed by their barcode/index sequences into something approximating the sample names that you want to associate the sequence data with. 
+
+**Demultiplexing** refers to the step in processing where you'd use the barcode information in order to know which sequences came from which samples after they had all been sequenced together. Here we would sort sequenced reads into separate files for each sample. If we received our data already demultiplexed, with a separate file for each sample, and barcodes clipped. With current Illumina software and standard library preparation protocols, the demultiplexing is usually done for you and the basespace download includes one FASTQ file for each sample; the index reads are not included.
+
+**Barcodes** refer to the unique sequences that were ligated to each of your individual samples' genetic material before the samples got all mixed together. Depending, you may get your samples already split into individual fastq files, or they may be lumped together all in one fastq file with barcodes still attached for you to do the splitting. If this is the case, you should also have a "mapping" file telling you which barcodes correspond with which samples (see metadata section). With Illumina sequencing, the [barcode](https://drive5.com/usearch/manual/pipe_demux.html) is usually positioned before the sequencing primer so does not appear in the forward reads that contain the biological sequence. Barcodes are obtained by making one (single-indexing) or two (dual-indexing) additional reads which are sometimes called i1 for single indexing and i5+i7 for dual indexing.
+
+After navigating into the directory with map.txt in it, you can view using: 
+```{bash, eval=FALSE, engine="sh"}
+column -t map.txt | head  
+```
+
+**Indexes** There seems to be quite a bit of ambiguity out there with regard to barcodes vs [indexes.](https://kb.10xgenomics.com/hc/en-us/articles/115002777072-How-do-I-demultiplex-by-sample-index-and-barcode-) These terms are sometimes used [interchangeably](https://drive5.com/usearch/manual/pipe_demux.html) in the genomics world - for example, what Illumina's Sequencing Analysis Viewer refers to as barcodes, are what we call sample indices - but in the context of our products, they have distinct meanings. During library preparation, the barcoding steps are done before the indexing steps (final PCR step), and this order is reversed during the bioinformatics pipeline - we first need to demultiplex by sample index to separate reads into their respective libraries before dealing with the library-specific barcodes in subsequent steps.
+
+[I](https://astrobiomike.github.io/amplicon/demultiplexing) think indexes refer to sample-identifying sequences that are sequenced separately from the primary forward and reverse reads of our target fragment, and this is why they come in separate fastq files but in the same order as your reads. I've only ever worked with amplicon data that had barcodes that were sequenced with the forward read, and therefore were in the forward read ahead of the primers. So that is what was exemplified here. 
+
+If you received Undetermined files from the sequence run, you can demultiplex those based on the index calls in the header of the sequence. For example: 
+
+```
+@A00484:41:H3G5VDRXX:1:1101:1018:1000 1:N:0:GGCGTTAT+CCTATTGG
+                                            ^^^^ indexes ^^^^
+```
+
+So for the example that we ran above (sample 1), the index is CGTCGGTAA. 
+
+```
+@M06923:26:000000000-JV49B:1:1101:9099:1079 1:N:0:CGTCGGTAA
+                                                  ^^^^ index 
+```
+
+## Examine Undetermined samples
+
+Let's look closer into the Undetermined sample. 
+
+```{bash, eval=FALSE, engine="sh"}
+gunzip -c Undetermined_S0_L001_R1_001.fastq.gz | head -n 4
+```
+
+```
+@M06923:26:000000000-JV49B:1:1101:15377:1000 1:N:0:NNNNNNNNN
+NTGAGTGTCAGCAGCCGCGGTAATACGTAGGGTGCAAGCGTTGTCCGGAATTATTGGGCGTAAAGAGCTCGTAGGCGGTGTGTCGCGTCTGCTGTGAAAATCCAAGGCTCAACCTTGGACCTGCAGTGGGTACGGGCACACTAGAGTGCGGTAGGGGAGATTGGAATTCCTGGTGT
++
+#8BCCGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG
+```
+
+First, it’s always good to get an idea of read counts for a given batch of samples. If you have all of your R1 and R2 files in a directory, you can use something like the following to count reads in each file:
+
+```{bash, eval=FALSE, engine="sh"}
+for i in *_R1_*; do echo $i; gunzip -c $i | wc -l; done 
+
+10_S10_L001_R1_001.fastq.gz
+ 2220688
+11_S11_L001_R1_001.fastq.gz
+ 2476064
+12_S12_L001_R1_001.fastq.gz
+ 2347596
+13_S13_L001_R1_001.fastq.gz
+ 2284768
+14_S14_L001_R1_001.fastq.gz
+ 2592524
+15_S15_L001_R1_001.fastq.gz
+ 2007384
+16_S16_L001_R1_001.fastq.gz
+ 2366752
+1_S1_L001_R1_001.fastq.gz
+ 2386132
+2_S2_L001_R1_001.fastq.gz
+ 1892144
+3_S3_L001_R1_001.fastq.gz
+ 2613432
+4_S4_L001_R1_001.fastq.gz
+ 2020652
+5_S5_L001_R1_001.fastq.gz
+ 2094560
+6_S6_L001_R1_001.fastq.gz
+     632
+7_S7_L001_R1_001.fastq.gz
+ 2965096
+8_S8_L001_R1_001.fastq.gz
+ 2484772
+9_S9_L001_R1_001.fastq.gz
+ 2722520
+Undetermined_S0_L001_R1_001.fastq.gz
+ 12519388
+```
+These are line counts, so be sure to divide these by 4 to get read counts. A pro-tip is that you can turn this into columns using the following find (.*)\n(.*)\n* and replace $1,$2\n commands work for your favorite text editor.
+
+R2 should have same readcounts as R1
+
+You want to compare this list to what you expect, being aware of samples that are either: (1) completely missing or (2) have very little data, like so:
+
+```{bash, eval=FALSE, engine="sh"}
+6_S6_L001_R1_001.fastq.gz
+     632
+```
+
+These samples are likely some with incorrect indexes (we expected them to get lots of reads, but, in reality, they received very few).
+
+
+Next take a peak into the undetermined file to get the sequencing machine name in the header line:
+
+```{bash, eval=FALSE, engine="sh"}
+gunzip -c Undetermined_S0_L001_R1_001.fastq.gz| head
+#or
+gunzip -c Undetermined_S0_L001_R1_001.fastq.gz| less
+```
+
+First, I [nucleotide BLASTED](https://blast.ncbi.nlm.nih.gov/Blast.cgi?PAGE_TYPE=BlastSearch) the first line of nucleotides to see if best hits are plausible bacteria (one possibility is that we had some E.coli contamination or something). I'm getting that the best hit is: 
+
+Pontimonas salivibrio	313	313	97%	5e-81	99.42%	1760810	CP026923.1
+
+So I think it's worth investigating further. 
+
+From our bash result, this was sequencer JV49B. So now, we can parse out all the indexes in the Undetermined_S0_L001_R1_001.fastq.gz file and count them to see if you can see what happened. Run the following:
+
+```{bash, eval=FALSE, engine="sh"}
+gunzip -c Undetermined_S0_L001_R1_001.fastq.gz| less
+```
+
+Then, enter “search mode” in less by typing /. I then generally search for the index from sample 6 (with low reads: CACTTCTGG) to see if something got mixed up. 
+
+It does seem like that is the case, bc in the search we're getting a few instances of that barcode coming up. 
+
+```{bash, eval=FALSE, engine="sh"}
+gunzip -c  Undetermined_S0_L001_R1_001.fastq.gz | grep "CACTTCTGG" | awk -F: '{print $NF}' | sort | uniq -c | sort -nr > R1_barcode_count.txt
+```
+
+Let’s take a look in the R1_barcode_count.txt we just created.
+
+```{bash, eval=FALSE, engine="sh"}
+less R1_barcode_count.txt
+```
+
+Then, enter “search mode” in less by typing /CACTTCTGG. This will highlight all the instances of that barcode. 
+
+So it seems that there was a mixup and the Undetermined sequences are actually the sample 6 (with super low read counts). This sample has already been demultiplexed, so we just still need to clip the barcodes out. 
+
+## DADA2 pipeline
+
+[This](https://astrobiomike.github.io/amplicon/16S_and_18S_mixed) is a useful resource. 
+
+```{r installpackages, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install(version = '3.14')
+BiocManager::install("dada2")
+BiocManager::install("ShortRead")
+BiocManager::install("Biostrings")
+BiocManager::install("DECIPHER")
+BiocManager::install("phangorn")
+BiocManager::install("ggplot2")
+BiocManager::install("phyloseq")
+```
+
+This downloads all the things! 
+
+#  LOAD LIBRARIES
+```{r loadlibs, eval=FALSE}
+library(dada2)#sequence processing
+library(ShortRead)
+library(Biostrings)
+library(DECIPHER)#sequence alignment
+library(phangorn) #phylogenetic tree generation
+library(dplyr) #for %>%
+library(ggplot2) #data viz and analysis
+library(gridExtra) #for grid.arrange()
+library(phyloseq) #data viz and analysis
+library(scales) #show_col
+library(microbiome) #for core microbiome analysis
+library(RColorBrewer) #colors
+library(wesanderson) #colors
+library(cowplot)
+library(forcats)
+```
+
+Along with the dada2 library, we also load the ShortRead and the Biostrings package (R Bioconductor packages; can be installed from the following locations, dada2, ShortRead and Biostrings) which will help in identification and count of the primers present on the raw FASTQ sequence files.
+
+# COLORS
+
+```{r}
+pal<- wes_palette("Zissou1", 16, type="continuous")
+
+show_col(pal)
+
+scale_colour_Publication <- c("#386cb0","#fdb462","#7fc97f","#ef3b2c","#662506","#a6cee3","#fb9a99","#984ea3","#ffff33")
+show_col(scale_colour_Publication)
+
+season_col<- c("#EBCE29", "#67CC8F", "#CC6767") #fall=orange, spring=green, then summer=red
+show_col(season_col)
+
+# Also define gray color palette
+redblue <- brewer.pal(10, "RdBu")
+show_col(redblue)
+
+show_col(gradient_n_pal(redblue)(seq(0, 1, length.out = 60)))
+```
+
+
+Define the following path variable so that it points to the directory containing those files on your machine:
+
+```{r setpath, eval=FALSE}
+path <- "~/Desktop/Github/16S-rRNA-analysis/data/raw_reads" #change ME to the directory containing the fastq files after unzipping
+list.files(path)
+```
+
+If the packages loaded successfully and your listed files match those here, you are ready to follow along with the ITS workflow.
+
+Before proceeding, we will now due a bit of housekeeping, and generate matched lists of the forward and reverse read files, as well as parsing out the sample name. Here we assume forward and reverse read files are in the format SAMPLENAME_1.fastq.gz and SAMPLENAME_2.fastq.gz, respectively, so string parsing may have to be altered in your own data if your filenames have a different format.
+
+```{r sortfiles, eval=FALSE}
+#sort files to ensure forward/reverse reads are in the same order
+fnFs <- sort(list.files(path, pattern = "_R1_001.fastq.gz"))
+fnRs <- sort(list.files(path, pattern = "_R2_001.fastq.gz"))
+
+```
+
+<!-- ### Identify primers -->
+
+<!-- The <> (forward) and <> (reverse) primers were used to amplify this dataset. We record the DNA sequences, including ambiguous nucleotides, for those primers. -->
+
+<!-- ```{r} -->
+<!-- FWD <- "ACCTGCGGARGGATCA"  ## CHANGE ME to your forward primer sequence -->
+<!-- REV <- "GAGATCCRTTGYTRAAAGTT"  ## CHANGE ME... -->
+
+
+<!-- forward_F1 = "ACACTCTTTCCCTACACGACGCTCTTCCGATCTGAGTGYCAGCMGCCGCGGTAA" -->
+<!-- forward_F2 = "ACACTCTTTCCCTACACGACGCTCTTCCGATCTTGAGTGYCAGCMGCCGCGGTAA" -->
+<!-- forward_F3 = "ACACTCTTTCCCTACACGACGCTCTTCCGATCTCTGAGTGYCAGCMGCCGCGGTAA" -->
+<!-- forward_F4 = "ACACTCTTTCCCTACACGACGCTCTTCCGATCTACTGAGTGYCAGCMGCCGCGGTAA" -->
+<!-- forward_F5 = "ACACTCTTTCCCTACACGACGCTCTTCCGATCTGACTGAGTGYCAGCMGCCGCGGTAA" -->
+<!-- forward_F6 = "ACACTCTTTCCCTACACGACGCTCTTCCGATCTTGACTGAGTGYCAGCMGCCGCGGTAA" -->
+
+<!-- reverse_F1 = "GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCTACGGACTACNVGGGTWTCTAAT"  -->
+
+<!-- ``` -->
+
+<!-- In theory if you understand your amplicon sequencing setup, this is sufficient to continue. However, to ensure we have the right primers, and the correct orientation of the primers on the reads, we will verify the presence and orientation of these primers in the data. -->
+
+<!-- ```{r} -->
+<!-- allOrients <- function(primer) { -->
+<!--     # Create all orientations of the input sequence -->
+<!--     require(Biostrings) -->
+<!--     dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors -->
+<!--     orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna),  -->
+<!--         RevComp = reverseComplement(dna)) -->
+<!--     return(sapply(orients, toString))  # Convert back to character vector -->
+<!-- } -->
+<!-- FWD.orients <- allOrients(FWD) -->
+<!-- REV.orients <- allOrients(REV) -->
+<!-- FWD.orients -->
+<!-- ``` -->
+
+## Plot quality scores and determine trimming cutoffs
+
+I followed [this](https://www.youtube.com/watch?v=wV5_z7rR6yw) DADA2 pipeline/tutorial from youtube. 
+
+```{r specifypaths, eval=FALSE}
+#Extract samples sames, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(fnFs, "_"), `[`, 1)
+#sample.names <- sapply(strsplit(fnRs, "_"), `[`, 1)
+
+#specify the pull path to the fnFs and fnRs
+fnFs <- file.path(path, fnFs)
+fnRs <- file.path(path, fnRs)
+```
+
+###Plot average quality scores for forward reads
+
+```{r plotqualityforward, eval=FALSE}
+plotQualityProfile(fnFs[1:2])
+```
+Overall, the quality scores of these two samples are very good. Scores never really dip below 30. We don't really need to trim these. If we want to be safe, we can trim 10 bp off the end of the reads to make sure we only have high quality data. Don't have to look at all the files before determining where to trim since there's not much variation in quality scores. 
+
+Plot average quality scores of reverse reads
+```{r plotqualityreverse, eval=FALSE}
+plotQualityProfile(fnRs[1:2])
+```
+Almost complete overlap with v4 regions. So we can be pretty aggressive with trimming. 
+Trim at 250bp??
+
+```{r newfilepath, eval=FALSE}
+# create a new file path to store filtered and trimmed reads
+filt_path <- file.path(path, "filtered") #place filtered files in filtered/ subdirectory
+
+#rename filtered files
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+```
+
+### Quality filtering and trimming
+
+```{r filterandtrim, eval=FALSE}
+#this step may take a while... may be a good idea to run first on a a subset of samples. 
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(290, 250), trimLeft=20, 
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE, 
+                     compress=TRUE, multithread = TRUE) #on windows set multithread=F
+
+head(out)
+```
+specify where your starting reads are and specify where you want to put the forward reads. 
+same with reverse. 
+cut forward reads at 290, reverse reads at 250. 
+consider how long your amplicon is and how much overlap you need. (dada2 needs 20nt by default)
+but for v4, you have almost complete overlap so it doesn't much matter. 
+for longer amplicons (v4-v5)
+trimLeft = 20 (making sure the primers are cut off...)
+maxN = max number of ambiguous bases allowed. here we get rid of any ambiguous base pairs. 
+maxEE = max amount of estimated errors. If you are losing too many reads due to poor sequence quality, you can relax this. 
+truncQ= truncated reads at the first instance of a Q score less than or equal to the value specified (2 is ~63% chance of a base call being incorrect!)
+re.phix = removes reads identified as belonging to the phiX phage (adds sequence diversity to the sample)
+compress= should FASTQ files be gzipped (saves memory)
+
+## Clip barcodes
+
+If you want a more precise way to clip barcodes, you can follow [this](https://benjjneb.github.io/dada2/ITS_workflow.html) tutorial. It'll show you how to identify and remove primers from the reads + verify primer orientation and removal. We don't really need to do that here because there is sufficient overlap bc we're looking at the V4 region. 
+
+## Error rate estimation
+
+```{r estimateerrors, eval=FALSE}
+#estimate the error model for DADA2 algorithm using forward reads
+errF <- learnErrors(filtFs, multithread=TRUE)
+#estimate the error model for DADA2 algorithm using reverse reads
+errR <- learnErrors(filtRs, multithread=TRUE)
+#Notice that error rate estimation takes longer for reverse reads. (more steps bc reverse reads are worse)
+```
+
+This command creates an error model that will be used by the DADA2 algorithm downstream. 
+Every batch of sequencing will have a different error rate (so important to rerun every time). 
+Algorithm starts with the assumption that the error rates are the maximum possible (takes most abundant sequence and that's the only sequence that's true and all the others are wrong. 
+Alternates error rate estimation and sample composition inference until they converge at a consistent solution that makes sense for both of those parameters. 
+
+Plot error rates
+```{r ploterrors, eval=FALSE}
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+```
+This plots frequency of each possible base transition as a function of quality score. 
+The black line is the observed error rates. 
+Red line is the expected error rate under the nominal definition of the Q value. 
+In general, freq of errors dec as quality score increase. 
+These look as expected so we can proceed with data analysis. 
+
+
+## Dereplicate reads
+
+Now that you've estimated your error model from your reads, the next thing to do is dereplicate them 
+
+This is so that dada2 doesn't have to work on every single read you have. speeds up computation. 
+```{r dereplicatereads, eval=FALSE}
+# dereplicate FASTQ files to speed up computation
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+#name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+## Sample inference! 
+
+This is the heart of the DADA2 program. This step takes a long time! 
+
+```{r sampleinference, eval=FALSE}
+#apply core sequence-variant inference algorithm to forward reads
+dadaFs<-dada(derepFs, err=errF, multithread = TRUE)
+
+#apply core sequence-variant inference algorithm to reverse reads
+dadaRs<-dada(derepRs, err=errR, multithread = TRUE)
+```
+Using the error model developed earlier (and the depreplicated reads), the algorithm calculates abundance p-values for each unique sequence. 
+Tests null hypothesis that a sequence (with a given error rate) is too abundant to be explained by sequencing errors. 
+Low p-value - indicates that there are more reads of sequence than can be explained by sequencing errors. 
+High p-value - a read was likely caused by errors (thrown out bc it's low quality data). 
+
+
+## Merge paired end reads
+
+Now that you've denoised all of your forward and reverse reads, you can actually merge all of them. 
+
+```{r merge, eval=FALSE}
+#merge denoised reads
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+#Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+This merges paired end reads only if they EXACTLY overlap. This is because both forward and reverse reads have been denoised and should be error-free. Can be changed by adding maxMismatch option (default is 0, can make it 1 or 2). 
+By default, the program requires 20nt of overlap but you can lower it if need be with minOverlap (or can concatenate your reads). 
+Since our reads almost completely overlap, we do not have to worry about this setting but you should keep it in mind if you sequenced larger regions like V4V5. Might have to compromise how much you trim earlier. 
+
+## Tabulate denoised and merged reads
+
+Now that you've merged forward and reverse reads, you can create a sequence table! 
+```{r tabulate, eval=FALSE}
+#organize ribosomal sequence variants (RSVs) into a sequence table (analogous to an OTU table) 
+seqtab <- makeSequenceTable(mergers) 
+dim(seqtab) 
+sum(seqtab)
+```
+The DADA2 sequence table is analogous to a traditional OTU table. Breaks down the size of these amplicons. 
+
+
+## Chimera checking and removal
+
+Chimera = a PCR artifact. If you're amplifying a region of your 16S gene, your primer will start amplifying the region that it targets... but at some point it will fall off and it won't go all the way through. That oligo can be used to prime another completely unrelated 16S region. You'll get amplicons that are actually fusions of 2 (or more) parent sequences. This command takes your sequence table and performs a multiple sequence alignment. Starts with your least abundant read and for all the reads that are more abundant, will do sequence alignments with all possible combinations to see if there's any overlap. 
+
+```{r chimeras, eval=FALSE}
+# perform de novo chimera sequence detection and removal
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+# calculate the proportion of non-chimeric RSVs (as a function of those that are)
+sum(seqtab.nochim)/sum(seqtab)
+#e.g. 71-96% of your reads are not chimeric. 
+
+sum(seqtab)/sum(seqtab.nochim)
+
+sum(seqtab.nochim) #total number of raw reads
+```
+
+Utilizes a de novo rather than reference-based system to check for two-parent (bimeric) chimeras
+Performs a Needleman-Wunsch global alignment of each sequence to all more abundant sequences. Searches for all possible combinations of "left" and "right" parents to completely cover child sequence. 
+
+To illustrate... you have 2 parents and during the course of amplification, you create this child read that's half and half. Next you align the child read with all possible parents. With some sequences, you can recognize and filter chimeras from your sequence table. 
+
+Here we may see that a vast majority (64.6%) of our unique RSVs are identified as bimeras (illustrates the importance of chimera checking). This is normal... HOWEVER, it SHOULD be that most of my total reads (second line) were not flagged as chimeric (96.6%). 
+
+The first time I ran this analysis, we find that a majority of TOTAL READS were chimeric (100-41%), so we had a problem... 
+
+The problem was mostly likely that the primers were not completely removed from reads. Using primers with ambiguous bases can cause reads to be flagged as chimeras. So I re-ran filterAndTrim() command using the trimLeft (=20) argument. Now this problem has been fixed! IF that hadn't fixed it, there could have been other factors at play. We could have tried trimming more low-quality bases. Think about which hypervariable region you're sequencing (i.e. V4 vs V4V5). How complex is your community? 
+
+## Assign Taxonomy
+
+Now that we have a sequence table with clean reads, we can assign taxonomy. 
+
+```{r taxonomy, eval=FALSE}
+# assign taxonomy using Silva database (RDP and Greengenes also available)
+# this is performed in two steps: this first one assigns phylum to genus
+
+taxa <- assignTaxonomy (seqtab.nochim, "~/Desktop/Github/16S-rRNA-analysis/data/taxonomy/silva_nr99_v138.1_wSpecies_train_set.fa.gz", multithread = TRUE)
+unname(head(taxa)) #this dataset assigns taxonomy up to species when possible. 
+```
+Utilizes RDP Naive Bayesian Classifier algorithm to assign taxonomy to chimera-removed sequence variants
+Even though it has RDP in the data, you can use RDP, Greengenes, or SILVA for classification of 16S sequences. DADA2 formatted databases available online for all 3. RDP is more frequently updated than Greengenes. 
+
+I found the SILVA database [here](https://benjjneb.github.io/dada2/assign.html) and downloaded from [here](https://zenodo.org/record/4587955#.Ye3lCFjMLQ0). 
+
+If you'd like to add species-level assignment to the dataset without species in it (we don't need it here but I'll keep it for future reference), you would use the "addSpecies" command as shown here. 
+```{r species, eval=FALSE}
+# assign species (when possible)
+system.time({taxa.plus <- addSpecies(taxa, "~/Desktop/Github/16S-rRNA-analysis/data/taxonomy/silva_species_assignment_v138.1.fa.gz", verbose=TRUE)
+colnames(taxa.plus) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+unname(taxa.plus)})
+```
+As you can see, only a few (246/5852) of the taxa were assigned to the species level. 
+Possible explanation: v4 regions is fairly small (combination of regions like v4v5 might give more resolution)
+v4 region doesn't have a lot of variation (other regions like v1 might be better for species level assignment bc it's more variable). 
+
+## Align sequences
+
+```{r align, eval=FALSE}
+#extract sequences from DADA2 output
+sequences <- getSequences(seqtab.nochim)
+names(sequences)<-sequences
+
+#run sequence alignment (MSA) using DECIPHER
+alignment <- AlignSeqs(DNAStringSet(sequences), anchor=NA)
+```
+If you aren't that interested in phylogeny, you could technically stop here. We currently have a sequence table but no info about possible phylogenetic relationships between them. 
+
+A tree is needed to calculate certain metrics like Unifrac. Sequence alignment is needed before tree construction. 
+
+## Construct Phylogenetic Tree
+
+Next you pass that sequence alignment 
+
+```{r tree, eval=FALSE}
+#change sequence alignment output into a phyDat structure. 
+phang.align <- phyDat(as(alignment, "matrix"), type="DNA")
+
+#create distance matrix
+dm <- dist.ml(phang.align)
+
+#perform neighbor joining
+treeNJ<- NJ(dm) # note, tip order != sequence order
+
+#internal maximum likelihood
+fit = pml(treeNJ, data=phang.align)
+##negative edges length changed to 0!
+
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE, 
+                    rearrangement = "stochastic", control = pml.control(trace=0))
+# pml computes the likelihood of a given tree. 
+# optim.pml() will optimize tree topology and branch length for your selected model of nucleotide evolution. 
+#this last step takes a LONG time. 12 hours? more?
+
+# Save tree to image
+save(fitGTR, file = "OTU_tree.RData")
+plot_tree(fitGTR$tree)
+```
+
+constructs a phylogenetic tree using neighbor joining methods. 
+subsequently uses this tree as a starting point to create a GTR+G+I (generalized time-reversible with Gamma rate variation) maximum likelihood tree. 
+
+Fasttree also works to create trees from your data. 
+
+## Import data into [Phyloseq](https://joey711.github.io/phyloseq/)
+
+to actually analyze and visualize your data. 
+```{r phyloseq, eval=FALSE}
+map <- import_qiime_sample_data("~/Desktop/Github/16S-rRNA-analysis/map.txt")
+
+dim(otu_table(seqtab.nochim, taxa_are_rows = FALSE)) #17 samples, 19216 taxa
+
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               tax_table(taxa.plus), phy_tree(fitGTR$tree))
+#takes all components we have and puts into a usable format. 
+
+#merge PS object with map
+ps <- merge_phyloseq(ps, map)
+ps
+```
+Imports metadata specified in the provided mapping file. 
+Will associate metadata with each sample. 
+Allows for visualization and analysis. 
+
+# explore phyloseq object
+
+##Concatenating the taxonomy as a particular string for plotting
+
+https://github.com/joey711/phyloseq/issues/213
+see joey's comment on May 20, 2013^^
+```{r}
+str(ps)
+# Fix the node labels for the sake of the tree at the end:
+phy_tree(ps)$tip.label <- gsub("\\.[[:alnum:]]+$", "", phy_tree(ps)$tip.label)
+# Add a new rank, Strain, with the OTU ids
+tax_table(ps) <- cbind(tax_table(ps), Strain=taxa_names(ps))
+# Define the ranks you want to include
+myranks = c("Genus", "Species", "Strain")
+mylabels = apply(tax_table(ps)[, myranks], 1, paste, sep="", collapse="_")
+# Add concatenated labels as a new rank after strain
+tax_table(ps) <- cbind(tax_table(ps), catglab=mylabels)
+# Check this out on a tree
+plot_tree(ps, label.tips="catglab", color="Phylum", nodelabf=nodeplotboot(),
+                    ladderize="left", plot.margin=2.15, size="abundance")
+```
+
+## Root phylogenetic tree
+
+Currently, the phylogenetic tree is not rooted. Though it is not necessary here, you will need to root the tree if you want to calculate any phylogeny based diversity metrics (like Unifrac). 
+
+```{r roottree, eval=FALSE}
+set.seed(711)
+phy_tree(ps) <- root(phy_tree(ps), sample(taxa_names(ps), 1), resolve.root=TRUE)
+is.rooted(phy_tree(ps))
+```
+If you don't do this step, the program will randomly assign the root of the tree every time you calculate these metrics! Then it's possible to get different answers from the same data. 
+
+If you don't plan on using phylogenetic diversity metrics (Faith's PD, Unifrac, etc) this is not necessary. Shannon and Simpson (alpha diversity) and Bray-Curtis Dissimilarity (beta diversity) all don't need phylogeny to be calculated. 
+
+## Data summary and assessment
+
+While there are numerous possible ways to evaluate your data, a standard starting approach would consist of the following [steps](https://github.com/shandley/Microbiome-Analysis-Using-R/blob/master/analysis/16S_analysis.Rmd):
+
+1) Evaluate Amplicon Sequence Variants (ASV) summary statistics
+2) Detect and remove outlier samples
+3) Taxon cleaning
+4) Prevalence estimation and filtering
+
+```{r data-assessment, eval=FALSE}
+# Create a new data frame of the sorted row sums, a column of sorted values from 1 to the total number of individuals/counts for each ASV and a categorical variable stating these are all ASVs.
+readsumsdf <- data.frame(nreads = sort(taxa_sums(ps), decreasing = TRUE), 
+                        sorted = 1:ntaxa(ps),
+                        type = "ASVs")
+
+#total number of reads
+sum(readsumsdf$nreads)
+
+# Make a data frame with a column for the read counts of each sample for histogram production
+sample_sum_df <- data.frame(sum = sample_sums(ps))
+# Make plots
+# Generates a bar plot with # of reads (y-axis) for each taxa. Sorted from most to least abundant
+# Generates a second bar plot with # of reads (y-axis) per sample. Sorted from most to least
+p.reads = ggplot(readsumsdf, aes(x = sorted, y = nreads)) +
+  geom_bar(stat = "identity") +
+  ggtitle("ASV Assessment") +
+  scale_y_log10() +
+  facet_wrap(~type, scales = "free") +
+  ylab("# of Sequences")
+# Histogram of the number of Samples (y-axis) at various read depths
+p.reads.hist <- ggplot(sample_sum_df, aes(x = sum)) + 
+  geom_histogram(color = "black", fill = "firebrick3", binwidth = 150) +
+  ggtitle("Distribution of sample sequencing depth") + 
+  xlab("Read counts") +
+  ylab("# of Samples")
+# Final plot, side-by-side
+grid.arrange(p.reads, p.reads.hist, ncol = 2)
+# Basic summary statistics
+summary(sample_sums(ps))
+
+```
+
+The above data assessment is useful for getting an idea of 1) the number of sequences per taxa (left plot). This will normally be a "long tail" with some taxa being highly abundant in the data tapering off to taxa with very few reads, 2) the number of reads per sample. Note the spike at the lowest number of reads due to samples taken from mice given antibiotics. Very low read count can be indicative of a failed reaction. Both of these plots will help give an understanding of how your data are structured across taxa and samples and will vary depending on the nature of your samples.
+
+Samples with unexpectedly low number of sequences can be considered for removal. This is an intuitive process and should be instructed by your understanding of the samples in your study. For example, if you have 5 samples from stool samples, one would expect to obtain thousands, if not several thousands of ASV. This may not be the case for other tissues, such as spinal fluid or tissue samples. Similarly, you may not expect thousands of ASV from samples obtained from antibiotic treated organisms. Following antibiotic treatment you may be left with only dozens or hundreds of ASV. So contextual awareness about the biology of your system should guide your decision to remove samples based on ASV number.
+
+Importantly, at each stage you should document and justify your decisions. If you are concerned that sample removal will alter the interpretation of your results, you should run your analysis on the full data and the data with the sample(s) removed to see how the decision affects your interpretation.
+
+The above plots provide overall summaries about the number of ASV found in all of your samples. However, they are not very useful for identifying and removing specific samples. One way to do this is using code from the following R chunk.
+
+*Step 2: Detect and remove outlier samples*
+
+Detecting and potentially removing samples outliers (those samples with underlying data that do not conform to experimental or biological expectations) can be useful for minimizing technical variance. One way to identify sample outliers is shown in the R chunk below.
+
+```{r sample-removal-identification, eval=FALSE}
+# Format a data table to combine sample summary data with sample variable data
+ss <- sample_sums(ps)
+sd <- as.data.frame(sample_data(ps))
+ss.df <- merge(sd, data.frame("ASV" = ss), by ="row.names")
+
+# Plot the data by the treatment variable
+y = 1000 # Set a threshold for the minimum number of acceptable reads. Can start as a guess
+x = "SampleName" # Set the x-axis variable you want to examine
+label = "SampleName" # This is the label you want to overlay on the points
+
+p.ss.boxplot <- ggplot(ss.df, aes_string(x, y = "ASV", color = "SampleName")) + 
+  geom_boxplot(outlier.colour="NA", position = position_dodge(width = 0.8)) +
+  geom_jitter(size = 2, alpha = 0.6) +
+  scale_y_log10() +
+  #facet_wrap(~SampleName) +
+  geom_hline(yintercept = y, lty = 2) +
+  geom_text(aes_string(label = label), size = 3, nudge_y = 0.05, nudge_x = 0.05)
+p.ss.boxplot
+```
+The example data does have 1 sample with fewer than 1,000 ASV. When questionable samples arise you should take note of them so if there are samples which behave oddly in downstream analysis you can recall this information and perhaps justify their removal. In this case lets remove them for practice. 
+
+```{r sample-outlier-removal, eval=FALSE}
+nsamples(ps)
+ps1 <- ps %>%
+  subset_samples(SampleName != "PCR_R_bc41")
+nsamples(ps1)
+
+ps2 <- ps %>%
+  subset_samples(SampleName != "PCR_R_bc41") %>%
+  subset_samples(SampleName !="PCR_R_bc41_NA")
+nsamples(ps2)
+```
+Note that we created a new PhyloSeq object called ps1. This preserves all of the data in the original ps0 and creates a new data object with the offending samples removed called ps1.
+
+Failure to detect and remove "bad" samples can make interpreting ordinations much more challenging as they typically project as "outliers" severely skewing the rest of the samples. These samples also increase variance and will impede your ability to identify differentially abundant taxa between groups. Thus sample outlier removal should be a serious and thoughtful part of every analysis in order to obtain optimal results.
+
+*Step 3: Taxon cleaning*
+
+I would first like to get a sense of what taxa we see in our dataset! and what percentages of all reads these taxa make up. 
+
+```{r}
+rank_names(ps2)
+table(tax_table(ps2)[,"Phylum"], exclude=NULL) 
+ntaxa(ps2)
+```
+
+This creates a table, number of features for each phyla. This shows a few phyla for which  only 1 feature was observed. Those may be worth filtering, and we'll check that next. First, notice that in this case, 132 features were annotated with a phylum of NA. These features are probably artifacts in a dataset like this, and should be removed. 
+
+The following ensures that features with ambiguous phylum annotation are also removed. Note the flexibility in defining strings that should be considered ambiguous annotation. 
+
+```{r}
+ps2_clean <- subset_taxa(ps2, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+
+table(tax_table(ps2_clean)[,"Phylum"], exclude=NULL) 
+
+ntaxa(ps2_clean) - ntaxa(ps2) #took out the 132 NAs
+ntaxa(ps2_clean) #5720 features in the clean version! 
+```
+
+Here we'll compare how many of these features (what percent) are bacterial vs.archael vs. cyanobacteria! 
+
+```{r}
+ps2_archaea <- ps2_clean %>%
+  subset_taxa(Kingdom == "Archaea")
+ntaxa(ps2_archaea)/ntaxa(ps2_clean) #5.2% ASVs are Archaea
+
+ps2_bacteria <- ps2_clean %>%
+  subset_taxa(Kingdom == "Bacteria")
+ntaxa(ps2_bacteria)/ntaxa(ps2_clean) #94.8% ASVs are Bacteria
+
+ps2_cyanobacteria <- ps2_clean %>%
+  subset_taxa(
+    Class   == "Cyanobacteriia" | #or Chloroplast
+    Phylum  == "Cyanobacteria" #or Chloroplast
+  )
+ntaxa(ps2_cyanobacteria)/ntaxa(ps2_clean) #4.0% ASVs are cyanobacteria
+
+#suggests they might be in deeper layers of MB
+```
+
+## Community composition plotting
+
+Classic bar plots of bacterial phyla present per sample can be useful for communicating "high level" results. These are relatively easy to interpret when major shifts in microbial communities are present, such as in this study where antibiotics are used However, they are not effective at detecting subtle shifts in communities or taxa and do not convey any statistical significance and can be subjectively interpreted. Interpretation of these plots should always be subject to subsequent statistical analysis.
+
+```{r community-composition-plots, eval=FALSE}
+# Create a data table for ggplot
+ps2_bacteria_phylum <- ps2_bacteria %>%
+  tax_glom(taxrank = "Phylum") %>%                     # agglomerate at phylum level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance (or use ps0.ra)
+  psmelt()  %>%                                       # Melt to long format for easy ggploting
+  filter(Abundance > 0.01)                             # Filter out low abundance taxa
+```
+
+```{r}
+str(ps2_bacteria_phylum)
+ps2_bacteria_phylum$Phylum
+
+ps2_bacteria_phylum$Phylum <- factor(ps2_bacteria_phylum$Phylum, levels=c("Proteobacteria", "Bacteroidota", "Actinobacteriota", "Firmicutes", "Desulfobacterota", "Verrucomicrobiota", "Chloroflexi", "Planctomycetota", "Spirochaetota", "Patescibacteria", "Halanaerobiaeota", "Bdellovibrionota", "Myxococcota"))
+
+# You can rerun the first bit of code in this chunk and change Phylum to Species, Genus, etc.
+# Draw in interactive plotly plot
+plotly::ggplotly(p.ra.bacteria_phylum)
+
+Actinobacteriota <- subset(ps2_bacteria_phylum, ps2_bacteria_phylum$Phylum=="Actinobacteriota")
+Proteobacteria <- subset(ps2_bacteria_phylum, ps2_bacteria_phylum$Phylum=="Proteobacteria")
+Bacteroidota <- subset(ps2_bacteria_phylum, ps2_bacteria_phylum$Phylum=="Bacteroidota")
+
+mean(Actinobacteriota$Abundance)*100
+mean(Proteobacteria$Abundance)*100
+mean(Bacteroidota$Abundance)*100
+```
+Mostly Proteobacteria (40%), then Bacteroidota (32%), then actinobacteriota (14%). This is the order that we should plot the phyla in with the plot. 
+
+```{r genus-composition-plots, eval=FALSE}
+# Create a data table for ggplot
+ps2_bacteria_genus <- ps2_bacteria %>%
+  tax_glom(taxrank = "Genus") %>%                     # agglomerate at phylum level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance (or use ps0.ra)
+  psmelt() %>%                                         # Melt to long format for easy ggploting
+  filter(Abundance > 0.01)                             # Filter out low abundance taxa
+# Plot - Genus
+
+ps2_bacteria_genus$Genus
+
+ps2_bacteria_genus$Genus <- factor(ps2_bacteria_genus$Genus, levels=c("Psychroflexus", "Candidatus Aquiluna", "Spiribacter", "Pontimonas", "Halomonas", "Brumimicrobium", "Roseibaca", "Marinobacter", "Marivita", "Seohaeicola", "Roseovarius", "Escherichia-Shigella", "ML602J-51", "Owenweeksia", "Cutibacterium", "Staphylococcus", "Candidatus Limnoluna", "WDS1C4", "Thioalkalimicrobium", "Yoonia-Loktanella", "GKS98 freshwater group", "Alteromonas", "Sediminimonas", "Nitrincola", "Halanaerobium", "Corynebacterium", "Idiomarina", "Pseudohongiella", "Izimaplasma", "Aliidiomarina", "Pseudomonas", "Algoriphagus", "LD29", "Thioalkalivibrio", "Pseudohaliea", "Chromatocurvus", "Rhodobaculum", "Streptococcus", "Pseudoalteromonas"))
+```
+
+## comprehensive barplot
+
+https://stackoverflow.com/questions/62627480/how-to-creat-a-bar-graph-of-microbiota-data-with-one-color-for-higher-taxonomic
+
+##### with only 3 phyla
+
+```{R}
+ColourPalleteMulti <- function(df, group, subgroup){
+
+  # Find how many colour categories to create and the number of colours in each
+  categories <- aggregate(as.formula(paste(subgroup, group, sep="~" )), df, function(x) length(unique(x)))
+  category.start <- (scales::hue_pal(l = 100)(nrow(categories))) # Set the top of the colour pallete
+  category.end  <- (scales::hue_pal(l = 40)(nrow(categories))) # set the bottom
+
+  # Build Colour pallette
+  colours <- unlist(lapply(1:nrow(categories),
+                          function(i){
+                            colorRampPalette(colors = c(category.start[i], category.end[i]))(categories[i,2])}))
+  return(colours)
+}
+
+phylums <- c('Proteobacteria','Bacteroidota','Actinobacteriota')
+
+ps2_bacteria_genus$Phylum[!ps2_bacteria_genus$Phylum %in% phylums] <- "Others"
+ps2_bacteria_genus$Genus[!ps2_bacteria_genus$Phylum %in% phylums] <- "Others"
+
+ps2_bacteria_genus$Genus[ps2_bacteria_genus$Phylum=="Proteobacteria" & 
+ !ps2_bacteria_genus$Genus %in% c('Spiribacter', 'Halomonas', 'Roseibaca', 'Marinobacter','Marivita', 'Seohaeicola', 'Roseovarius', 'Escherichia-Shigella', 'Owenweeksia', 'WDS1C4', 'Thioalkalimicrobium', 'Yoonia-Loktanella', 'GKS98 freshwater group', 'Alteromonas', 'Sediminimonas', 'Nitrincola', 'Idiomarina', 'Pseudohongiella', 'Aliidiomarina', 'Pseudomonas', 'Thioalkalivibrio', 'Pseudohaliea', 'Chromatocurvus', 'Rhodobaculum', 'Pseudoalteromonas')] <- "Other Proteobacteria"
+
+ps2_bacteria_genus$Genus[ps2_bacteria_genus$Phylum=="Bacteroidota" &
+ !ps2_bacteria_genus$Genus %in% c('Psychroflexus','Algoriphagus')] <- "Other Bacteroidota"
+
+ps2_bacteria_genus$Genus[ps2_bacteria_genus$Phylum=="Actinobacteriota" & 
+ !ps2_bacteria_genus$Genus %in% c('Candidatus Aquiluna','Pontimonas','Brumimicrobium','ML602J−51', 'Cutibacterium', 'Candidatus Limnoluna', 'Corynebacterium')] <- "Other Actinobacteriota"
+
+ps2_bacteria_genus$Sample <- factor(ps2_bacteria_genus$Sample, levels=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"))
+
+#library(forcats)
+#library(dplyr)
+ps2_bacteria_genus2 <- select(ps2_bacteria_genus, Sample, Phylum, Genus) %>%
+  mutate(Phylum=factor(Phylum, levels=c(phylums, "Others")),
+         Genus=fct_reorder(Genus, 10*as.integer(Phylum) + grepl("Other", Genus))) 
+
+colours <- ColourPalleteMulti(ps2_bacteria_genus2, "Phylum", "Genus")
+
+#library(ggplot2)
+Phyla_Genera_bacteria_plot <- ggplot(ps2_bacteria_genus2, aes(x=Sample, fill = Genus)) + 
+  geom_bar(position="fill", color="white") +  # Stacked 100% barplot
+  scale_fill_manual("", values=colours) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5)) +  # Vertical x-axis tick labels
+  scale_y_continuous(labels = scales::percent_format()) +
+    scale_x_discrete(labels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15")) +
+  labs(y="Relative abundance") +
+  theme_bw(base_size=9, base_family="Palatino") + 
+  theme(axis.text.y=element_text(size=16, colour= "black")) +
+  theme(axis.text.x=element_text(size=16, colour= "black")) +
+  theme(axis.title.x=element_text(size=16, colour = "black")) +
+  theme(axis.title.y=element_text(size=16, colour = "black"))
+Phyla_Genera_bacteria_plot
+```
+
+# by order
+
+Since the Kanik et al. (2020) paper that we are comparing shows microbialite-associated bacteria by ORDER, let's also make a comprehensive barplot of OUR nematode-associated bacteria by ORDER. 
+
+```{r community-composition-plots, eval=FALSE}
+# Create a data table for ggplot
+ps2_bacteria_phylum <- ps2_bacteria %>%
+  tax_glom(taxrank = "Phylum") %>%                     # agglomerate at phylum level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance (or use ps0.ra)
+  psmelt()  %>%                                       # Melt to long format for easy ggploting
+  filter(Abundance > 0.005)                             # Filter out low abundance taxa
+```
+
+```{r}
+str(ps2_bacteria_phylum)
+ps2_bacteria_phylum$Phylum
+
+ps2_bacteria_phylum$Phylum <- factor(ps2_bacteria_phylum$Phylum, levels=c("Proteobacteria", "Bacteroidota", "Actinobacteriota", "Firmicutes", "Desulfobacterota", "Verrucomicrobiota", "Chloroflexi", "Planctomycetota", "Spirochaetota", "Patescibacteria", "Halanaerobiaeota", "Bdellovibrionota", "Myxococcota"))
+
+Actinobacteriota <- subset(ps2_bacteria_phylum, ps2_bacteria_phylum$Phylum=="Actinobacteriota")
+Proteobacteria <- subset(ps2_bacteria_phylum, ps2_bacteria_phylum$Phylum=="Proteobacteria")
+Bacteroidota <- subset(ps2_bacteria_phylum, ps2_bacteria_phylum$Phylum=="Bacteroidota")
+
+mean(Actinobacteriota$Abundance)*100
+mean(Proteobacteria$Abundance)*100
+mean(Bacteroidota$Abundance)*100
+```
+Mostly Proteobacteria (40%), then Bacteroidota (32%), then actinobacteriota (14%). This is the order that we should plot the phyla in with the plot. 
+
+```{r genus-composition-plots, eval=FALSE}
+# Create a data table for ggplot
+ps2_bacteria_order <- ps2_bacteria %>%
+  tax_glom(taxrank = "Order") %>%                     # agglomerate at phylum level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance (or use ps0.ra)
+  psmelt() %>%                                         # Melt to long format for easy ggploting
+  filter(Abundance > 0.005)                             # Filter out low abundance taxa
+
+# Plot - Order
+
+ps2_bacteria_order$Order
+
+order_of_orders<-ps2_bacteria_order %>% 
+  group_by(Phylum, Order) %>%
+  #group_by(Order) %>%
+  summarize(Freq=n()) %>%
+  arrange(desc(Freq)) 
+order_of_orders #shows the orders present in all samples
+
+ps2_bacteria_order$Ordered_orders <- factor(ps2_bacteria_order$Order, levels=c("Micrococcales", "Chitinophagales", "Cytophagales", "Flavobacteriales", "ML602M-17", "Chloroplast", "Burkholderiales", "Enterobacterales", "Gammaproteobacteria Incertae Sedis", "Nitrococcales", "Pseudomonadales", "Rhodobacterales", "Rickettsiales", "Balneolales", "Sphingobacteriales", "Propionibacteriales", "Bacteroidales", "Staphylococcales", "Thiomicrospirales", "Rhizobiales", "Corynebacteriales", "Sphingomonadales", "Kapabacteriales", "Pirellulales", "Spirochaetales", "Bradymonadales", "Desulfobacterales", "Izemoplasmatales", "Chthoniobacterales", "Lactobacillales", "Halanaerobiales", "Ectothiorhodospirales", "Anaerolineales", "RBG-13-54-9", "Chromatiales", "Xanthomonadales", "Opitutales", "Aminicenantales", "Micromonosporales", "Microtrichales", "Bdellovibrionales", "Cyanobacteriales", "Bacillales", "Oscillospirales", "Peptostreptococcales-Tissierellales", "Polyangiales", "Steroidobacterales", "Tistrellales", "Petrotogales"))
+```
+
+## comprehensive barplot
+
+https://stackoverflow.com/questions/62627480/how-to-creat-a-bar-graph-of-microbiota-data-with-one-color-for-higher-taxonomic
+
+##### with only 3 phyla
+
+```{R}
+ColourPalleteMulti <- function(df, group, subgroup){
+
+  # Find how many colour categories to create and the number of colours in each
+  categories <- aggregate(as.formula(paste(subgroup, group, sep="~" )), df, function(x) length(unique(x)))
+  category.start <- (scales::hue_pal(l = 100)(nrow(categories))) # Set the top of the colour pallete
+  category.end  <- (scales::hue_pal(l = 40)(nrow(categories))) # set the bottom
+
+  # Build Colour pallette
+  colours <- unlist(lapply(1:nrow(categories),
+                          function(i){
+                            colorRampPalette(colors = c(category.start[i], category.end[i]))(categories[i,2])}))
+  return(colours)
+}
+
+phylums <- c('Proteobacteria','Bacteroidota','Actinobacteriota')
+
+ps2_bacteria_order$Phylum[!ps2_bacteria_order$Phylum %in% phylums] <- "Others"
+ps2_bacteria_order$Order[!ps2_bacteria_order$Phylum %in% phylums] <- "Others"
+
+ps2_bacteria_order$Order[ps2_bacteria_order$Phylum=="Proteobacteria" & 
+ !ps2_bacteria_order$Order %in% c('Burkholderiales', 'Enterobacterales', 'Gammaproteobacteria Incertae Sedis', 'Nitrococcales', 'Pseudomonadales','Rhodobacterales', 'Rickettsiales', 'Thiomicrospirales', 'Rhizobiales', 'Sphingomonadales', 'Ectothiorhodospirales', 'Chromatiales', 'Xanthomonadales', 'Steroidobacterales', 'Tistrellales')] <- "Other Proteobacteria"
+
+ps2_bacteria_order$Order[ps2_bacteria_order$Phylum=="Bacteroidota" &
+ !ps2_bacteria_order$Order %in% c('Chitinophagales','Cytophagales', 'Flavobacteriales', 'ML602M-17', 'Balneolales', 'Sphingobacteriales', 'Bacteroidales', 'Kapabacteriales')] <- "Other Bacteroidota"
+
+ps2_bacteria_order$Order[ps2_bacteria_order$Phylum=="Actinobacteriota" & 
+ !ps2_bacteria_order$Order %in% c('Micrococcales','Propionibacteriales','Corynebacteriales', 'Aminicenantales', 'Micromonosporales', 'Microtrichales')] <- "Other Actinobacteriota"
+
+ps2_bacteria_order$Sample <- factor(ps2_bacteria_order$Sample, levels=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"))
+
+library(forcats)
+
+ps2_bacteria_order2 <- select(ps2_bacteria_order, Sample, Phylum, Order) %>%
+  mutate(Phylum=factor(Phylum, levels=c(phylums, "Others")),
+         Order=fct_reorder(Order, 10*as.integer(Phylum) + grepl("Other", Order))) 
+
+colours <- ColourPalleteMulti(ps2_bacteria_order2, "Phylum", "Order")
+
+#library(ggplot2)
+Phyla_Order_bacteria_plot <- ggplot(ps2_bacteria_order2, aes(x=Sample, fill = Order)) + 
+  geom_bar(position="fill", color="white") +  # Stacked 100% barplot
+  scale_fill_manual("", values=colours) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5)) +  # Vertical x-axis tick labels
+  scale_y_continuous(labels = scales::percent_format()) +
+      scale_x_discrete(labels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15")) +
+  labs(y="Relative abundance") +
+  theme_bw(base_size=9, base_family="Palatino") + 
+  theme(axis.text.y=element_text(size=16, colour= "black")) +
+  theme(axis.text.x=element_text(size=16, colour= "black")) +
+  theme(axis.title.x=element_text(size=16, colour = "black")) +
+  theme(axis.title.y=element_text(size=16, colour = "black"))
+Phyla_Order_bacteria_plot
+```
+
+Plots 
+
+```{r}
+ggsave("~/Desktop/Phyla_Order_bacteria_plot.pdf", 
+ plot = Phyla_Order_bacteria_plot, # or give ggplot object name as in myPlot,
+ width = 25, height = 15, 
+ units = "cm", # other options c("in", "cm", "mm"), 
+ dpi = 300, 
+ useDingbats=FALSE)
+```
+
+## Ecological Diversity metrics
+
+In microbial community analysis, we are usually interested in two different families of diversity metrics, alpha diversity (ecological diversity within a sample) and beta diversity (ecological differences between samples). 
+
+### Alpha diversity metrics plotting
+
+Alpha diversity is a standard tool researchers can use to calculate the diversity within a single sample. These can measure richness (How many taxa do we observe/total number of observed taxa), evenness (How even are abundances distributed across taxa), and mixtures (Metrics that combine both richness and evenness, such as the Shannon index and Simpson's index). 
+
+These represent the number of bacterial taxa present in a study or study group and the relationships between relative abundance and how evenly taxa are distributed. These are classic representations of species number and diversity in a study which provide useful summary information about the numbers and relative abundances of bacterial taxa within your study. Alpha diversity will provide a single value/covariate for each sample, can be treated as any other sample measurement, and is suitable for classic univariate tests (t-test, Mann-Whitney U test, etc). 
+
+Similar to the plot above, we can calculate several measures of alpha diversity, add them to a data frame and use ggplot2 to follow the alpha diversity trajectory over time.
+
+You must use untrimmed datasets for meaningful
+results, as these estimates (and even the ``observed'' richness)
+are highly dependent on the number of singletons. You can always
+trim the data later on if needed, just not before using this
+function.
+
+```{r omit-outlier, eval=FALSE}
+nsamples(ps)
+ps3 <- ps %>%
+  subset_samples(SampleName != "PCR_R_bc41_NA") %>%
+  subset_samples(SampleName != "PCR_R_bc41")
+nsamples(ps3)
+```
+
+```{r alpha-diversity-plots, eval=FALSE}
+shannon<- plot_richness(ps3, x="SampleName", scales="fixed", measures = "Shannon") + theme_bw(base_size=9, base_family="Palatino") + scale_x_discrete(labels=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16")) +   scale_y_continuous(limits=c(0, 5.3),
+                     breaks=c(0, 1, 2, 3, 4, 5), 
+                     labels=c("0", "1", "2", "3", "4", "5"))+ labs(x = "Nematode",
+       y = "Alpha Diversity Measure")+
+  annotate("rect", ymin=1.69, ymax=3.03, xmin=-Inf, xmax=Inf, color = NA, alpha = 0.2, fill="#13B030") #hyperhaline lakes from Tandon et al. 2020
+shannon
+
+simpson<- plot_richness(ps3, x="SampleName", scales="fixed", measures = "Simpson") + theme_bw(base_size=9, base_family="Palatino") + scale_x_discrete(labels=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16")) +   scale_y_continuous(limits=c(0, 1.0),
+                     breaks=c(0, .25, .5, .75, 1), 
+                     labels=c("0", "0.25", "0.5", "0.75", "1"))+ labs(x = "Nematode",
+       y = "Alpha Diversity Measure")+
+  annotate("rect", ymin=0.06, ymax=0.37, xmin=-Inf, xmax=Inf, color = NA, alpha = 0.2, fill="#13B030") #hyperhaline lakes from Tandon et al. 2020
+simpson
+
+library(cowplot)
+alphadiv_bacteria <- plot_grid(shannon, simpson, labels = "AUTO", ncol = 2, align = 'v')
+
+ggsave("~/Desktop/alphadiv_bacteria.pdf", 
+ plot = alphadiv_bacteria, # or give ggplot object name as in myPlot,
+ width = 17, height = 9, 
+ units = "cm", # other options c("in", "cm", "mm"), 
+ dpi = 300, 
+ useDingbats=FALSE)
+```
+This command will plot the computed values for Shannon and Simpson diversity. 
+You can also output the calculated values themselves with the following command: 
+estimate_richness(). 
+Notice the error message - we never actually trimmed or rarefied our data so what gives? In DADA2, singletons always result in an abundance p-value of 1. It is incredibly difficult to differentiate true singletons from those caused by sequencing errors (can artificially. 
+
+Shannon is usually a measure of richness. 
+Simpson is more a measure of evenness. 
+
+```{r}
+plotly::ggplotly(shannon)
+median(shannon$data$value) #bacterial
+```
+
+## Rarefaction curves
+
+Check the sequencing depth with rarefaction curves. Rarefaction curves are used to estimate whether all the diversity of the true community was captured. Each line represents a different sample (i.e. column) and shows how many OTUs are found in a random subset of different numbers of reads. The rarecurve function from the vegan package will do the random sub-sampling and plot the results for an abundance matrix. For example: here we'll plot the rarefaction curve for a single sample: 
+
+This is a good way to perform a quality check on our data: 
+
+```{r, rarefaction, echo=FALSE}
+library(vegan)
+
+df2 = data.frame(ASVs=rowSums(otu_table(ps2)>0), reads=sample_sums(ps2), sample_data(ps2))
+
+#ggplot(dat.1, aes(x = SampleName, y = Abundance, color = Phylum, group = Phylum)) +
+  
+ggplot(df2, aes(x = reads)) + 
+  geom_histogram(bins=50, color='black', fill='grey') + 
+  theme_bw()+
+  geom_vline(xintercept=10000, color='red', linetype='dashed') +
+  labs(title="Histogram: Reads per Sample") + 
+  xlab("Read Count") + 
+  ylab("Sample Count")
+
+out <- rarecurve(otu_table(ps2), step=100 , lwd=2, ylab="ASVs", label=F,
+              main="Rarefaction Curve for all samples")
+out
+```
+
+I haven't gotten this part to work yet... 
+
+```{r}
+
+# We use the rarefaction curve data produce by vegan above
+names(out) = rownames(otu_table(ps3))
+
+# Coerce data into "long" form.
+protox <- mapply(FUN = function(x, y) {
+  mydf <- as.data.frame(x)
+  colnames(mydf) <- "value"
+  mydf$SampleID <- y
+  mydf$subsample <- attr(x, "Subsample")
+  mydf
+}, x = out, y = as.list(names(out)), SIMPLIFY = FALSE)
+
+xy <- do.call(rbind, protox)
+rownames(xy) <- NULL  # pretty
+xy = data.frame(xy, 
+  sample_data(ps3)[match(xy$SampleID, rownames(sample_data(ps3))), ])
+
+# Plot Rarefaction curve
+rarefactionplot <- ggplot(xy, aes(x = subsample, y = value, color = SampleID)) +
+  theme_bw() + 
+  scale_color_discrete(guide = FALSE) +  # turn legend on or off
+  geom_line() +
+ geom_vline(xintercept=10000, color= "red", linetype='dashed') + 
+    labs(x = "sequenced reads",
+       y = "ASVs detected") +
+  theme_bw(base_size=9, base_family="Palatino") + 
+  theme(axis.text.y=element_text(size=12, colour= "black")) +
+  theme(axis.text.x=element_text(size=12, colour= "black")) +
+  theme(axis.title.x=element_text(size=12, colour = "black")) +
+  theme(axis.title.y=element_text(size=12, colour = "black"))+
+  theme(legend.position = "NONE")
+rarefactionplot
+```
+
+The rarefaction curves suggest that there is a range of ~800-1200 ASV per sample in the study. 
+
+For this sample, few new OTUs are observed after about 20,000 reads. Since the number of OTUs found flattens out, it suggests that the sample had sufficient reads to capture most of the diversity (or reach a point of diminishing returns). 
+
+Rarefaction curves show the number of Amplicon Sequence Variants detected as a function of sequencing depth. Optimally the curve will flatten out, indicating that most of the diversity in the population has been sampled. Depending on the type of experiment, it may not be necessary to fully sample the community in order to obtain useful information about the major changes or trends, especially for common community members.
+
+```{r}
+ggsave("~/Desktop/rarefactionplot.pdf", 
+ plot = rarefactionplot, # or give ggplot object name as in myPlot,
+ width = 25, height = 10, 
+ units = "cm", # other options c("in", "cm", "mm"), 
+ dpi = 300, 
+ useDingbats=FALSE)
+```
+
+# CORE
+
+Core microbiota/microbiome refers to the set of species shared by (almost) all individuals. You can read more about the core microbiota definition in Salonen et al. 2012.
+
+## Prevalence
+
+Question: What is the most prevalent genus in the example data. How prevalent it is in the sample collection (tip: use the microbiome::prevalence function).
+
+Relative population frequencies; at 1% compositional abundance threshold:
+
+http://siobhonlegan.com/BIO514-microbiome/06_data_visualization.html
+
+#### Bacteria By Genus: 
+
+```{r}
+#library("devtools")
+#install_github("microbiome/microbiome")
+#library(microbiome)
+
+# Transform to compositional abundances
+# Calculate compositional version of the data
+# (relative abundances)
+ps.prune <- prune_taxa(taxa_sums(ps2) > 0, ps2)
+pseq.rel <- microbiome::transform(ps.prune, "compositional")
+
+ps.m3.rel.gen <- aggregate_taxa(pseq.rel, "Genus")
+prevalences <- seq(.05, 1, .05) #0.5 = 95% prevalence
+#detections <- 10^seq(log10(1e-4), log10(.2), length = 10)
+#detections <- round(10^seq(log10(0.01), log10(.2), length = 9), 3)
+detections <- round(10^seq(log10(1e-3), log10(.2), length = 10), 3)
+
+#detections <- round(10^seq(log10(1e-4), log10(.2), length = 10), 3)
+#(1e-3) = 0.001% abundance; change "-3" to -2 to increase to 0.01%
+#(0.2) is 10^(log10(0.2)) which = 0.2 abundance
+
+core_heatmap_bacteria_genus <- plot_core(ps.m3.rel.gen, 
+                plot.type = "heatmap", 
+                colours = rev(brewer.pal(5, "RdBu")),
+                prevalences = prevalences, 
+                detections = detections, min.prevalence = .5) +
+    xlab(NULL)+
+    #scale_x_continuous(limits=c(0.001, 0.2),
+    #                 breaks=c(0.001, 0.002, 0.003, 0.006, 0.011, 0.019, 0.034, 0.062, 0.111, 0.2), 
+    #                 labels=c("0.001", "0.002", "0.003", "0.006", "0.011", "0.019", "0.034", "0.062", "0.111", "0.2"))+
+    theme_bw(base_size=11, base_family="Palatino") +
+  #Adjusts axis text size and legend bar height
+  theme(axis.text.y= element_text(size=11, face="italic"),
+  #      axis.text.x.bottom=element_text(size=6),
+       axis.title = element_text(size=13),
+  #      legend.text = element_text(size=8),
+  #      legend.title = element_text(size=10), 
+        axis.text.x = element_text(angle = 45, hjust=1)
+  )
+core_heatmap_bacteria_genus
+```
+
+#### Bacteria By Order: 
+
+```{r}
+#library("devtools")
+#install_github("microbiome/microbiome")
+#library(microbiome)
+
+# Transform to compositional abundances
+# Calculate compositional version of the data
+# (relative abundances)
+ps.prune_bacteria <- prune_taxa(taxa_sums(ps2_bacteria) > 0, ps2_bacteria)
+pseq.rel_bacteria <- microbiome::transform(ps.prune_bacteria, "compositional")
+
+ps.m3.rel.order <- aggregate_taxa(pseq.rel_bacteria, "Order")
+prevalences <- seq(.05, 1, .05) #0.5 = 95% prevalence
+#detections <- 10^seq(log10(1e-4), log10(.2), length = 10)
+#detections <- round(10^seq(log10(0.01), log10(.2), length = 9), 3)
+detections <- round(10^seq(log10(1e-3), log10(.2), length = 10), 3)
+
+#detections <- round(10^seq(log10(1e-4), log10(.2), length = 10), 3)
+#(1e-3) = 0.001% abundance; change "-3" to -2 to increase to 0.01%
+#(0.2) is 10^(log10(0.2)) which = 0.2 abundance
+
+core_heatmap_bacteria_order <- plot_core(ps.m3.rel.order, 
+                plot.type = "heatmap", 
+                colours = rev(brewer.pal(5, "RdBu")),
+                prevalences = prevalences, 
+                detections = detections, min.prevalence = .5) +
+    xlab(NULL)+
+    #scale_x_continuous(limits=c(0.001, 0.2),
+    #                 breaks=c(0.001, 0.002, 0.003, 0.006, 0.011, 0.019, 0.034, 0.062, 0.111, 0.2), 
+    #                 labels=c("0.001", "0.002", "0.003", "0.006", "0.011", "0.019", "0.034", "0.062", "0.111", "0.2"))+
+    theme_bw(base_size=11, base_family="Palatino") +
+  #Adjusts axis text size and legend bar height
+  theme(axis.text.y= element_text(size=11, face="italic"),
+  #      axis.text.x.bottom=element_text(size=6),
+       axis.title = element_text(size=13),
+  #      legend.text = element_text(size=8),
+  #      legend.title = element_text(size=10), 
+        axis.text.x = element_text(angle = 45, hjust=1)
+  )
+core_heatmap_bacteria_order
+```
+
+# Archaea
+
+## Community composition plotting
+
+Classic bar plots of bacterial phyla present per sample can be useful for communicating "high level" results. These are relatively easy to interpret when major shifts in microbial communities are present, such as in this study where antibiotics are used However, they are not effective at detecting subtle shifts in communities or taxa and do not convey any statistical significance and can be subjectively interpreted. Interpretation of these plots should always be subject to subsequent statistical analysis.
+
+```{r community-composition-plots, eval=FALSE}
+# Create a data table for ggplot
+ps2_archaea_phylum <- ps2_archaea %>%
+  tax_glom(taxrank = "Phylum") %>%                     # agglomerate at phylum level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance (or use ps0.ra)
+  psmelt()  %>%                                       # Melt to long format for easy ggploting
+  filter(Abundance > 0.01)                             # Filter out low abundance taxa
+```
+
+```{r}
+sort(table(ps2_archaea_phylum$Phylum))
+
+ps2_archaea_phylum$Phylum <- factor(ps2_archaea_phylum$Phylum, levels=c("Halobacterota", "Nanoarchaeota", "Thermoplasmatota", "Crenarchaeota", "Euryarchaeota", "Hadarchaeota", "Iainarchaeota", "Asgardarchaeota",  "Aenigmarchaeota", "Micrarchaeota", "Altiarchaeota"))
+
+Halobacterota <- subset(ps2_archaea_phylum,
+                        ps2_archaea_phylum$Phylum=="Halobacterota")
+Nanoarchaeota <- subset(ps2_archaea_phylum,
+                        ps2_archaea_phylum$Phylum=="Nanoarchaeota")
+Thermoplasmatota <- subset(ps2_archaea_phylum,
+                           ps2_archaea_phylum$Phylum=="Thermoplasmatota")
+Crenarchaeota <- subset(ps2_archaea_phylum,
+                        ps2_archaea_phylum$Phylum=="Crenarchaeota")
+Euryarchaeota <- subset(ps2_archaea_phylum,
+                        ps2_archaea_phylum$Phylum=="Euryarchaeota")
+Hadarchaeota <- subset(ps2_archaea_phylum, 
+                       ps2_archaea_phylum$Phylum=="Hadarchaeota")
+Iainarchaeota <- subset(ps2_archaea_phylum,
+                        ps2_archaea_phylum$Phylum=="Iainarchaeota")
+Asgardarchaeota <- subset(ps2_archaea_phylum,
+                          ps2_archaea_phylum$Phylum=="Asgardarchaeota")
+Aenigmarchaeota <- subset(ps2_archaea_phylum,
+                          ps2_archaea_phylum$Phylum=="Aenigmarchaeota")
+Micrarchaeota <- subset(ps2_archaea_phylum,
+                        ps2_archaea_phylum$Phylum=="Micrarchaeota")
+Altiarchaeota <- subset(ps2_archaea_phylum,
+                        ps2_archaea_phylum$Phylum=="Altiarchaeota")
+
+mean(Halobacterota$Abundance)*100
+mean(Nanoarchaeota$Abundance)*100
+mean(Thermoplasmatota$Abundance)*100
+mean(Crenarchaeota$Abundance)*100
+mean(Euryarchaeota$Abundance)*100
+mean(Hadarchaeota$Abundance)*100
+mean(Asgardarchaeota$Abundance)*100
+mean(Iainarchaeota$Abundance)*100
+mean(Aenigmarchaeota$Abundance)*100
+mean(Micrarchaeota$Abundance)*100
+mean(Altiarchaeota$Abundance)*100
+```
+Mostly Halobacterotoa (71%), then Nanoarchaeota (16%). This is the order that we should plot the phyla in with the plot. 
+
+```{r family-composition-plots, eval=FALSE}
+# Create a data table for ggplot
+ps2_archaea_family <- ps2_archaea %>%
+  tax_glom(taxrank = "Family") %>%                     # agglomerate at phylum level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance (or use ps0.ra)
+  subset_samples(SampleName != "PCR_R_bc41") %>%
+  psmelt() %>%                                         # Melt to long format for easy ggploting
+  filter(Abundance > 0.01)                             # Filter out low abundance taxa
+
+sort(table(ps2_archaea_family$Family))
+
+ps2_archaea_family$Family <- factor(ps2_archaea_family$Family, levels=c("Halobacteriaceae", "SCGC AAA286-E23", "Haloferacaceae", "SCGC AAA011-D5", "Halomicrobiaceae", "GW2011", "Candidatus Iainarchaeum", "Nitrososphaeraceae", "Methanosarcinaceae"))
+
+
+Halobacteriaceae <- subset(ps2_archaea_family,
+                        ps2_archaea_family$Family=="Halobacteriaceae")
+mean(Halobacteriaceae$Abundance)*100
+```
+76.58% of reads are Halobacteriaceae
+
+## comprehensive barplot
+
+https://stackoverflow.com/questions/62627480/how-to-creat-a-bar-graph-of-microbiota-data-with-one-color-for-higher-taxonomic
+
+##### with only 3 phyla
+
+```{R}
+sort(table(ps2_archaea_family$Phylum))
+sort(table(ps2_archaea_family$Family))
+
+phylums <- c("Halobacterota", "Nanoarchaeota", "Iainarchaeota", "Crenarchaeota")
+
+ps2_archaea_family$Sample
+
+ps2_archaea_family$Sample <- factor(ps2_archaea_family$Sample, levels=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"))
+
+ps2_archaea_family2 <- select(ps2_archaea_family, Sample, Phylum, Family) %>%
+  mutate(Phylum=factor(Phylum, levels=c(phylums, "Others")),
+         Family=fct_reorder(Family, 10*as.integer(Phylum) + grepl("Other", Family))) 
+
+colours <- ColourPalleteMulti(ps2_archaea_family2, "Phylum", "Family")
+
+#library(ggplot2)
+Phyla_Family_archaea_plot <- ggplot(ps2_archaea_family2, aes(x=Sample, fill = Family)) + 
+  geom_bar(position="fill", color="white") +  # Stacked 100% barplot
+  scale_fill_manual("", values=colours) +
+  theme(axis.text.x=element_text(angle=90, vjust=0.5)) +  # Vertical x-axis tick labels
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(y="Relative abundance") +
+  theme_bw(base_size=9, base_family="Palatino") + 
+  theme(axis.text.y=element_text(size=16, colour= "black")) +
+  theme(axis.text.x=element_text(size=16, colour= "black")) +
+  theme(axis.title.x=element_text(size=16, colour = "black")) +
+  theme(axis.title.y=element_text(size=16, colour = "black"))
+Phyla_Family_archaea_plot
+```
+
+Plots 
+
+```{r}
+ggsave("~/Desktop/Phyla_Family_archaea_plot.pdf", 
+ plot = Phyla_Family_archaea_plot, # or give ggplot object name as in myPlot,
+ width = 17, height = 9, 
+ units = "cm", # other options c("in", "cm", "mm"), 
+ dpi = 300, 
+ useDingbats=FALSE)
+```
+
+```{r community-composition-plots, eval=FALSE}
+# Create a data table for ggplot
+ps2_archaea_genera <- ps2_archaea %>%
+  tax_glom(taxrank = "Genus") %>%                     # agglomerate at phylum level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance (or use ps0.ra)
+  psmelt()  %>%                                       # Melt to long format for easy ggploting
+  filter(Abundance > 0.01)                             # Filter out low abundance taxa
+
+ps2_archaea_genera
+```
+## Alpha diversity metrics plotting
+
+Alpha diversity is a standard tool researchers can use to calculate the number of bacterial taxa present in a study or study group and the relationships between relative abundance and how evenly taxa are distributed. These are classic representations of species number and diversity in a study which provide useful summary information about the numbers and relative abundances of bacterial taxa within your study.
+
+Similar to the plot above, we can calculate several measures of alpha diversity, add them to a data frame and use ggplot2 to follow the alpha diversity trajectory over time.
+
+You must use untrimmed datasets for meaningful
+results, as these estimates (and even the ``observed'' richness)
+are highly dependent on the number of singletons. You can always
+trim the data later on if needed, just not before using this
+function.
+
+```{r omit-outlier, eval=FALSE}
+nsamples(ps2_archaea)
+
+ps3_archaea <- ps2_archaea %>%
+  subset_samples(SampleName != "PCR_R_bc41_NA") %>%
+  subset_samples(SampleName != "PCR_R_bc41")
+nsamples(ps3_archaea)
+```
+
+```{r alpha-diversity-plots, eval=FALSE}
+shannon_archaea<- plot_richness(ps3_archaea, x="SampleName", scales="fixed", measures = "Shannon") + theme_bw(base_size=9, base_family="Palatino") + scale_x_discrete(labels=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16")) +   scale_y_continuous(limits=c(0, 5.3),
+                     breaks=c(0, 1, 2, 3, 4, 5), 
+                     labels=c("0", "1", "2", "3", "4", "5"))+ labs(x = "Nematode",
+       y = "Alpha Diversity Measure")+
+  annotate("rect", ymin=1.69, ymax=3.03, xmin=-Inf, xmax=Inf, color = NA, alpha = 0.2, fill="#13B030") #hyperhaline lakes from Tandon et al. 2020
+shannon_archaea
+
+simpson_archaea<- plot_richness(ps3_archaea, x="SampleName", scales="fixed", measures = "Simpson") + theme_bw(base_size=9, base_family="Palatino") + scale_x_discrete(labels=c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16")) +   scale_y_continuous(limits=c(0, 1.0),
+                     breaks=c(0, .25, .5, .75, 1), 
+                     labels=c("0", "0.25", "0.5", "0.75", "1"))+ labs(x = "Nematode",
+       y = "Alpha Diversity Measure")+
+  annotate("rect", ymin=0.06, ymax=0.37, xmin=-Inf, xmax=Inf, color = NA, alpha = 0.2, fill="#13B030") #hyperhaline lakes from Tandon et al. 2020
+simpson_archaea
+
+alphadiv_archaea <- plot_grid(shannon_archaea, simpson_archaea, labels = "AUTO", ncol = 2, align = 'v')
+
+ggsave("~/Desktop/alphadiv_archaea.pdf", 
+ plot = alphadiv_archaea, # or give ggplot object name as in myPlot,
+ width = 17, height = 9, 
+ units = "cm", # other options c("in", "cm", "mm"), 
+ dpi = 300, 
+ useDingbats=FALSE)
+
+
+alphadiv_all <- plot_grid(shannon, simpson, shannon_archaea, simpson_archaea, labels = "AUTO", ncol = 2, nrow=2, align = 'v')
+
+ggsave("~/Desktop/alphadiv_all.pdf", 
+ plot = alphadiv_all, # or give ggplot object name as in myPlot,
+ width = 17, height = 17, 
+ units = "cm", # other options c("in", "cm", "mm"), 
+ dpi = 300, 
+ useDingbats=FALSE)
+
+```
+
+This command will plot the computed values for Shannon and Simpson diversity. 
+You can also output the calculated values themselves with the following command: 
+estimate_richness(). 
+Notice the error message - we never actually trimmed or rarefied our data so what gives? In DADA2, singletons always result in an abundance p-value of 1. It is incredibly difficult to differentiate true singletons from those caused by sequencing errors (can artificially. 
+
+Shannon is usually a measure of richness. 
+Simpson is more a measure of evenness. 
+
+```{r}
+median(shannon_archaea$data$value) #bacterial
+```
+
+## Rarefaction curves
+
+Check the sequencing depth with rarefaction curves. Rarefaction curves are used to estimate whether all the diversity of the true community was captured. Each line represents a different sample (i.e. column) and shows how many OTUs are found in a random subset of different numbers of reads. The rarecurve function from the vegan package will do the random sub-sampling and plot the results for an abundance matrix. For example: here we'll plot the rarefaction curve for a single sample: 
+
+This is a good way to perform a quality check on our data: 
+
+```{r, rarefaction, echo=FALSE}
+library(vegan)
+
+df2 = data.frame(ASVs=rowSums(otu_table(ps2)>0), reads=sample_sums(ps2), sample_data(ps2))
+
+#ggplot(dat.1, aes(x = SampleName, y = Abundance, color = Phylum, group = Phylum)) +
+  
+ggplot(df2, aes(x = reads)) + 
+  geom_histogram(bins=50, color='black', fill='grey') + 
+  theme_bw()+
+  geom_vline(xintercept=10000, color='red', linetype='dashed') +
+  labs(title="Histogram: Reads per Sample") + 
+  xlab("Read Count") + 
+  ylab("Sample Count")
+
+out = rarecurve(otu_table(ps2), step=100 , lwd=2, ylab="ASVs", label=F,
+              main="Rarefaction Curve for all samples")
+
+```
+
+I haven't gotten this part to work yet... 
+
+```{r}
+
+# We use the rarefaction curve data produce by vegan above
+names(out) = rownames(otu_table(ps2))
+
+# Coerce data into "long" form.
+protox <- mapply(FUN = function(x, y) {
+  mydf <- as.data.frame(x)
+  colnames(mydf) <- "value"
+  mydf$SampleID <- y
+  mydf$subsample <- attr(x, "Subsample")
+  mydf
+}, x = out, y = as.list(names(out)), SIMPLIFY = FALSE)
+
+xy <- do.call(rbind, protox)
+rownames(xy) <- NULL  # pretty
+xy = data.frame(xy, 
+  sample_data(ps2)[match(xy$SampleID, rownames(sample_data(ps2))), ])
+
+# Plot Rarefaction curve
+rarefactionplot <- ggplot(xy, aes(x = subsample, y = value, color = SampleID)) +
+  theme_bw() + 
+  scale_color_discrete(guide = TRUE) +  # turn legend on or off
+  geom_line() +
+  geom_vline(xintercept=10000, color= "red", linetype='dashed') + 
+    labs(x = "sequenced reads",
+       y = "ASVs detected") +
+  theme_bw(base_size=9, base_family="Palatino") + 
+  theme(axis.text.y=element_text(size=12, colour= "black")) +
+  theme(axis.text.x=element_text(size=12, colour= "black")) +
+  theme(axis.title.x=element_text(size=12, colour = "black")) +
+  theme(axis.title.y=element_text(size=12, colour = "black"))+
+  theme(legend.position = "NONE")
+rarefactionplot
+```
+
+The rarefaction curves suggest that there is a range of ~800-1200 ASV per sample in the study. 
+
+For this sample, few new OTUs are observed after about 10,000 reads. Since the number of OTUs found flattens out, it suggests that the sample had sufficient reads to capture most of the diversity (or reach a point of diminishing returns). 
+
+Rarefaction curves show the number of Amplicon Sequence Variants detected as a function of sequencing depth. Optimally the curve will flatten out, indicating that most of the diversity in the population has been sampled. Depending on the type of experiment, it may not be necessary to fully sample the community in order to obtain useful information about the major changes or trends, especially for common community members.
+
+```{r}
+ggsave("~/Desktop/rarefactionplotBW.pdf", 
+ plot = out, # or give ggplot object name as in myPlot,
+ width = 25, height = 10, 
+ units = "cm", # other options c("in", "cm", "mm"), 
+ dpi = 300, 
+ useDingbats=FALSE)
+```
+
+## Core Archaea
+
+```{r}
+# Transform to compositional abundances
+# Calculate compositional version of the data
+# (relative abundances)
+ps.prune_archaea <- prune_taxa(taxa_sums(ps2_archaea) > 0, ps2_archaea) #keep only taxa with count above 0
+pseq.rel_archaea <- microbiome::transform(ps.prune_archaea, "compositional") #transforn to compositional (relative abundance)
+
+ps.m3.rel.phylum_archaea<- aggregate_taxa(pseq.rel_archaea, "Phylum")
+prevalences <- seq(.05, 1, .05) #0.5 = 95% prevalence
+#detections <- 10^seq(log10(1e-4), log10(.2), length = 10)
+#detections <- round(10^seq(log10(0.01), log10(.2), length = 9), 3)
+detections <- round(10^seq(log10(1e-3), log10(.2), length = 10), 3)
+
+#detections <- round(10^seq(log10(1e-4), log10(.2), length = 10), 3)
+#(1e-3) = 0.001% abundance; change "-3" to -2 to increase to 0.01%
+#(0.2) is 10^(log10(0.2)) which = 0.2 abundance
+
+core_heatmap_phylum_archaea <- plot_core(ps.m3.rel.phylum_archaea, 
+                                 plot.type = "heatmap", 
+                                 colours = rev(brewer.pal(5, "RdBu")),
+                                 prevalences = prevalences, 
+                                 detections = detections, min.prevalence = .5) +
+  xlab("Detection Threshold (% Relative Abundance)")+
+  #scale_x_discrete(values=c(0.001, 0.002, 0.003, 0.006, 0.011, 0.019, 0.034, 0.062, 0.111, 0.2), 
+  #                 labels=c("0.001", "0.002", "0.003", "0.006", "0.011", "0.019", "0.034", "0.062", "0.111", "0.2"))+
+  theme_bw(base_size=11, base_family="Palatino") + 
+  #Adjusts axis text size and legend bar height
+  theme(axis.text.y= element_text(size=11, face="italic"),
+  #      axis.text.x.bottom=element_text(size=6),
+       axis.title = element_text(size=13),
+  #      legend.text = element_text(size=8),
+  #      legend.title = element_text(size=10), 
+        axis.text.x = element_text(angle = 45, hjust=1)
+  )
+core_heatmap_phylum_archaea
+```
+
+### plot core
+```{r}
+core_16s <- plot_grid(core_heatmap_bacteria_genus, core_heatmap_phylum_archaea, labels = "AUTO", ncol = 1, nrow=2, align = 'v', rel_heights=c(5,1))
+
+ggsave("~/Desktop/core.pdf", 
+ plot = core_16s, # or give ggplot object name as in myPlot,
+ width = 20, height = 20, 
+ units = "cm", # other options c("in", "cm", "mm"), 
+ dpi = 300, 
+ useDingbats=FALSE)
+
+
+```
+
+```{r}
+#library("devtools")
+#install_github("microbiome/microbiome")
+library(microbiome)
+
+# Transform to compositional abundances
+# Calculate compositional version of the data
+# (relative abundances)
+ps.prune_archaea <- prune_taxa(taxa_sums(ps2_archaea) > 0, ps2_archaea)
+pseq.rel_archaea <- microbiome::transform(ps.prune_archaea, "compositional")
+
+library(RColorBrewer)
+
+ps.m3.rel.gen_archaea <- aggregate_taxa(pseq.rel_archaea, "Genus")
+prevalences <- seq(.05, 1, .05) #0.5 = 95% prevalence
+#detections <- 10^seq(log10(1e-4), log10(.2), length = 10)
+#detections <- round(10^seq(log10(0.01), log10(.2), length = 9), 3)
+detections <- round(10^seq(log10(1e-3), log10(.2), length = 10), 3)
+
+#detections <- round(10^seq(log10(1e-4), log10(.2), length = 10), 3)
+#(1e-3) = 0.001% abundance; change "-3" to -2 to increase to 0.01%
+#(0.2) is 10^(log10(0.2)) which = 0.2 abundance
+
+core_heatmap_archaea <- plot_core(ps.m3.rel.gen_archaea, 
+                plot.type = "heatmap", 
+                colours = rev(brewer.pal(5, "RdBu")),
+                prevalences = prevalences, 
+                detections = detections, min.prevalence = .5) +
+  xlab("Relative Abundance (%)")+
+  #Adjusts axis text size and legend bar height
+  theme(axis.text.y= element_text(size=8, face="italic"),
+        axis.text.x.bottom=element_text(size=6),
+        axis.title = element_text(size=10),
+        legend.text = element_text(size=8),
+        legend.title = element_text(size=10), 
+        axis.text.x = element_text(angle = 45, hjust=1)
+        )
+core_heatmap_archaea
+```
+
+
+core line plots
+
+```{r}
+# With compositional (relative) abundances
+#det <- c(0, 0.1, 0.5, 2, 5, 20)/100
+prevalences <- seq(.05, 1, .05)
+ #ggplot(d) + geom_point(aes(x, y)) + scale_x_continuous(trans="log10", limits=c(NA,1))
+
+core_line_archaea <- plot_core(pseq.rel_archaea, 
+          prevalences = prevalences, 
+          detections = detections, 
+          plot.type = "lineplot") +
+  xlab("Relative Abundance (%)") +
+  scale_color_gradient(low = "yellow", high = "darkblue") +
+  theme_bw()+
+  theme(axis.text.y= element_text(size=8),
+        axis.text.x.bottom=element_text(size=8),
+        axis.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        legend.title = element_text(size=8), 
+        axis.text.x = element_text(angle = 45, hjust=1))
+core_line_archaea
+```
+
+```{r}
+library(cowplot)
+core_archaea <- plot_grid(core_line_archaea, core_heatmap_archaea, labels = "AUTO", ncol = 2, nrow=1, align = 'v')
+
+ggsave("~/Desktop/core_archaea.pdf", 
+ plot = core_archaea, # or give ggplot object name as in myPlot,
+ width = 28, height = 12, 
+ units = "cm", # other options c("in", "cm", "mm"), 
+ dpi = 300, 
+ useDingbats=FALSE)
+
+```
+
+# Boyd data
+
+Demultiplex
+
+```{r}
+161128_Mapping_File_Template.txt
+
+Undetermined_S0_L001_R1_001.fastq.gz
+```
